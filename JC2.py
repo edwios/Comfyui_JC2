@@ -84,7 +84,7 @@ class ImageAdapter(nn.Module):
         return self.other_tokens(torch.tensor([2], device=self.other_tokens.weight.device)).squeeze(0)
 
 # 设置全局设备变量
-current_device = "cuda:0"
+current_device = mm.get_torch_device()
 
 def get_torch_device_patched():
     global current_device
@@ -92,16 +92,17 @@ def get_torch_device_patched():
         not torch.cuda.is_available()
         or comfy.model_management.cpu_state == comfy.model_management.CPUState.CPU
     ):
-        return torch.device("cpu")
+        return torch.device(current_device)
 
     return torch.device(current_device)
 
 # 覆盖ComfyUI的设备获取函数
 comfy.model_management.get_torch_device = get_torch_device_patched
 
-def load_models(model_path, dtype, device="cuda:0", device_map=None):
+def load_models(model_path, dtype, device=None, device_map=None):
     global current_device
-    current_device = device  # 设置当前设备
+    if device is not None:
+        current_device = device  # 设置当前设备
     from transformers import AutoModel, AutoProcessor, AutoTokenizer, PreTrainedTokenizer, PreTrainedTokenizerFast, AutoModelForCausalLM
     from peft import PeftModel
 
@@ -179,7 +180,7 @@ def load_models(model_path, dtype, device="cuda:0", device_map=None):
                 text_model.config.hidden_size, 
                 False, False, 38,
                 False
-            ).eval().to("cpu")
+            ).eval().to(current_device)
             image_adapter.load_state_dict(
                 torch.load(os.path.join(CHECKPOINT_PATH, "image_adapter.pt"), map_location=current_device, weights_only=False)
             )
@@ -245,8 +246,8 @@ def stream_chat(input_images: List[Image.Image], caption_type: str, caption_leng
     # 确定 chat_device
     if 'cuda' in current_device:
         chat_device = 'cuda'
-    elif 'cpu' in current_device:
-        chat_device = 'cpu'
+    elif 'mps' in current_device:
+        chat_device = 'mps'
     else:
         raise ValueError(f"Unsupported device type: {current_device}")
 
@@ -351,7 +352,7 @@ def stream_chat(input_images: List[Image.Image], caption_type: str, caption_leng
                 continue
 
             # Embed image
-            with torch.amp.autocast_mode.autocast(chat_device, enabled=True):
+            with torch.autocast(device_type=chat_device, enabled=True, dtype = torch.bfloat16):
                 vision_outputs = model.clip_model(pixel_values=pixel_values, output_hidden_states=True)
                 image_features = vision_outputs.hidden_states
                 embedded_images = model.image_adapter(image_features).to(chat_device)
@@ -494,7 +495,7 @@ class JoyCaption2:
         # 获取可用的GPU设备列表
         gpu_devices = [f"cuda:{i}" for i in range(torch.cuda.device_count())]
         if not gpu_devices:
-            gpu_devices = ["cpu"]  # 如果没有GPU可用，则仅提供CPU选项
+            gpu_devices = ["mps","cpu"]  # 如果没有GPU可用，则仅提供CPU选项
 
         # 定义额外的输入字段
         return {
@@ -532,7 +533,7 @@ class JoyCaption2:
         llm_model_path_cache = os.path.join(comfy_model_dir, "cache--" + sanitized_model_name)
 
         # 使用用户选择的设备
-        selected_device = device if torch.cuda.is_available() else 'cpu'
+        selected_device = device if torch.cuda.is_available() else mm.get_torch_device()
         model_loaded_on = selected_device  # 跟踪模型加载在哪个设备上
 
         try:
@@ -736,7 +737,7 @@ class JoyCaption2_simple:
         # 获取可用的GPU设备列表
         gpu_devices = [f"cuda:{i}" for i in range(torch.cuda.device_count())]
         if not gpu_devices:
-            gpu_devices = ["cpu"]  # 如果没有GPU可用，则仅提供CPU选项
+            gpu_devices = ["mps","cpu"]  # 如果没有GPU可用，则仅提供CPU选项
             
         # 定义额外的输入字段
         return {
@@ -774,7 +775,7 @@ class JoyCaption2_simple:
         llm_model_path_cache = os.path.join(comfy_model_dir, "cache--" + sanitized_model_name)
 
         # 使用用户选择的设备
-        selected_device = device if torch.cuda.is_available() else 'cpu'
+        selected_device = device if torch.cuda.is_available() else mm.get_torch_device()
         model_loaded_on = selected_device  # 跟踪模型加载在哪个设备上
 
         try:
