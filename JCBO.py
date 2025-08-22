@@ -206,7 +206,13 @@ def _load_model_shared(model_hf_id: str, quantization_mode: str, target_device: 
     model_path_local = os.path.join(model_dir_base, sanitized_model_repo_name)
     model_path_cache_tmp = os.path.join(model_dir_base, "cache--" + sanitized_model_repo_name)
 
-    effective_device = target_device if torch.cuda.is_available() else "cpu"
+    # 确定 effective_device
+    if 'cuda' in target_device:
+        effective_device = target_device
+    elif 'mps' in target_device:
+        effective_device = 'mps'
+    else:
+        effective_device = "cpu"
     print(f"JoyCaptionBetaOne (Shared): Using effective device: {effective_device} for model {model_hf_id}")
 
     reload_needed = False
@@ -249,13 +255,19 @@ def _load_model_shared(model_hf_id: str, quantization_mode: str, target_device: 
                 final_device_map = None if "cpu" in effective_device else effective_device
             elif current_quant_mode in ["nf4", "int8"]:
                 # This block is for CUDA devices as per the check above
-                bnb_config_params = QUANTIZATION_CONFIGS[current_quant_mode].copy()
-                bnb_config_params["llm_int8_skip_modules"] = LLM_SKIP_MODULES
-                q_config = BitsAndBytesConfig(**bnb_config_params)
-                model_load_kwargs["quantization_config"] = q_config
-                final_torch_dtype = torch.bfloat16 if current_quant_mode == "nf4" else "auto"
-                final_device_map = effective_device # MODIFICATION: Use the user-selected CUDA device
-                print(f"JoyCaptionBetaOne (Shared): Preparing {current_quant_mode} for specific device: {effective_device}")
+                if "cuda" not in effective_device:
+                    print(f"JoyCaptionBetaOne (Shared): Quantization '{current_quant_mode}' needs CUDA. Falling back to bf16 for {effective_device} for {model_hf_id}.")
+                    current_quant_mode = "bf16"
+                    final_torch_dtype = torch.bfloat16
+                    final_device_map = None if "cpu" in effective_device else effective_device
+                else:
+                    bnb_config_params = QUANTIZATION_CONFIGS[current_quant_mode].copy()
+                    bnb_config_params["llm_int8_skip_modules"] = LLM_SKIP_MODULES
+                    q_config = BitsAndBytesConfig(**bnb_config_params)
+                    model_load_kwargs["quantization_config"] = q_config
+                    final_torch_dtype = torch.bfloat16 if current_quant_mode == "nf4" else "auto"
+                    final_device_map = effective_device # MODIFICATION: Use the user-selected CUDA device
+                    print(f"JoyCaptionBetaOne (Shared): Preparing {current_quant_mode} for specific device: {effective_device}")
             else: # Fallback / fp32 (though not an explicit option)
                 final_torch_dtype = torch.float32 if "cpu" in effective_device else torch.bfloat16
                 final_device_map = None if "cpu" in effective_device else effective_device
@@ -269,6 +281,8 @@ def _load_model_shared(model_hf_id: str, quantization_mode: str, target_device: 
                 if free_vram_gb < 4 and current_quant_mode != "nf4": # NF4 is very light
                      print(f"Warning: Low VRAM ({free_vram_gb:.2f}GB on {effective_device}) for {current_quant_mode}")
                      # _clean_gpu_shared() # Consider if cleanup is aggressive enough or needed
+            elif "mps" in effective_device:
+                print(f"JoyCaptionBetaOne (Shared): Using MPS device for {model_hf_id}")
             
             model = LlavaForConditionalGeneration.from_pretrained(model_path_local, **model_load_kwargs)
             assert isinstance(model, LlavaForConditionalGeneration)
@@ -280,6 +294,9 @@ def _load_model_shared(model_hf_id: str, quantization_mode: str, target_device: 
                     apply_liger_kernel_to_llama(model=model.language_model)
                     CACHED_LIGER_ENABLED = True
                 except Exception as e: print(f"JoyCaptionBetaOne (Shared): LIGER kernel apply failed for {model_hf_id}: {e}"); CACHED_LIGER_ENABLED = False
+            elif "mps" in str(model.device).lower():
+                print(f"JoyCaptionBetaOne (Shared): MPS device detected, LIGER kernel not applicable")
+                CACHED_LIGER_ENABLED = False
             else: CACHED_LIGER_ENABLED = False
             
             CACHED_MODEL = model
@@ -315,7 +332,7 @@ class JoyCaptionBetaOne_Full:
         
         gpu_devices = [f"cuda:{i}" for i in range(torch.cuda.device_count())]
         if not gpu_devices:
-            gpu_devices = ["cpu"]
+            gpu_devices = ["mps","cpu"]  # 如果没有GPU可用，则仅提供CPU选项
 
         extra_options_inputs = {}
         for i, option_text in enumerate(EXTRA_OPTIONS_LIST):
@@ -387,7 +404,7 @@ class JoyCaptionBetaOne_Full:
                     generate_ids = model.generate(**inputs_on_device, max_new_tokens=max_new_tokens, do_sample=(temperature > 0), temperature=temperature if temperature > 0 else None, top_p=top_p if temperature > 0 else None, use_cache=True)
             except Exception as e:
                 print(f"{self.NODE_NAME}: Generation error: {e}")
-                if "out of memory" in str(e).lower() and "cuda" in str(model_device).lower(): 
+                if "out of memory" in str(e).lower() and ("cuda" in str(model_device).lower() or "mps" in str(model_device).lower()): 
                     print(f"{self.NODE_NAME}: OOM error detected. Clearing model cache."); _free_model_memory_shared()
                 return ([f"Error generating caption: {e}"],)
             input_token_len = inputs_on_device.input_ids.shape[1]
@@ -461,7 +478,7 @@ class JoyCaptionBetaOne_Simple:
         
         gpu_devices = [f"cuda:{i}" for i in range(torch.cuda.device_count())]
         if not gpu_devices:
-            gpu_devices = ["cpu"]
+            gpu_devices = ["mps","cpu"]  # 如果没有GPU可用，则仅提供CPU选项
         return {
             "required": {
                 "image": ("IMAGE",),
@@ -516,7 +533,7 @@ class JoyCaptionBetaOne_Simple:
                     generate_ids = model.generate(**inputs_on_device, max_new_tokens=max_new_tokens, do_sample=(temperature > 0), temperature=temperature if temperature > 0 else None, top_p=top_p if temperature > 0 else None, use_cache=True)
             except Exception as e:
                 print(f"{self.NODE_NAME}: Generation error: {e}")
-                if "out of memory" in str(e).lower() and "cuda" in str(model_device).lower(): 
+                if "out of memory" in str(e).lower() and ("cuda" in str(model_device).lower() or "mps" in str(model_device).lower()): 
                     print(f"{self.NODE_NAME}: OOM error detected. Clearing model cache."); _free_model_memory_shared()
                 return ([f"Error generating caption: {e}"],)
             input_token_len = inputs_on_device.input_ids.shape[1]
